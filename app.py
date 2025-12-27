@@ -67,6 +67,16 @@ async def gitlab_post(client: httpx.AsyncClient, path: str, json_body: Dict[str,
     return r.json()
 
 
+async def get_existing_discussions(
+    client: httpx.AsyncClient, project_id: int, mr_iid: int
+) -> List[Dict[str, Any]]:
+    """Получить все существующие discussions для MR"""
+    discussions = await gitlab_get(
+        client, f"/api/v4/projects/{project_id}/merge_requests/{mr_iid}/discussions"
+    )
+    return discussions or []
+
+
 async def get_mr_diff_refs_and_changes(
     client: httpx.AsyncClient, project_id: int, mr_iid: int
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
@@ -161,18 +171,49 @@ def line_in_diff(file_diff: str, target_new_line: int) -> bool:
     return False
 
 
+def is_duplicate_comment(
+    existing_discussions: List[Dict[str, Any]], path: str, line: int, comment: str
+) -> bool:
+    """Проверить, существует ли уже комментарий на этой позиции"""
+    for disc in existing_discussions:
+        notes = disc.get("notes") or []
+        for note in notes:
+            # Проверяем, что это AI комментарий
+            body = note.get("body") or ""
+            if not body.startswith("🤖"):
+                continue
+            
+            # Проверяем позицию
+            position = note.get("position")
+            if not position:
+                continue
+                
+            note_path = position.get("new_path") or position.get("old_path")
+            note_line = position.get("new_line") or position.get("old_line")
+            
+            # Если позиция и комментарий совпадают, это дубликат
+            if note_path == path and note_line == line and comment in body:
+                return True
+    return False
+
+
 async def post_inline_discussion(
     client: httpx.AsyncClient,
     project_id: int,
     mr_iid: int,
     diff_refs: Dict[str, str],
     item: ReviewItem,
+    existing_discussions: List[Dict[str, Any]],
 ) -> bool:
     base_sha = diff_refs.get("base_sha")
     start_sha = diff_refs.get("start_sha")
     head_sha = diff_refs.get("head_sha")
     if not (base_sha and start_sha and head_sha):
         return False
+
+    # Проверяем на дубликаты
+    if is_duplicate_comment(existing_discussions, item.path, item.line, item.comment):
+        return True  # Считаем успешным, т.к. комментарий уже есть
 
     body = {
         "body": f"🤖 **AI review ({item.severity})**: {item.comment}",
@@ -207,6 +248,9 @@ async def process_merge_request(payload: Dict[str, Any]) -> None:
             return
 
         async with httpx.AsyncClient() as client:
+            # Получаем существующие discussions для проверки дубликатов
+            existing_discussions = await get_existing_discussions(client, project_id, mr_iid)
+            
             diff_refs, files = await get_mr_diff_refs_and_changes(client, project_id, mr_iid)
             diff_text = build_diff_text(files)
 
@@ -236,7 +280,9 @@ async def process_merge_request(payload: Dict[str, Any]) -> None:
                     fallback.append(f"- `{it.path}:{it.line}` ({it.severity}) {it.comment}")
                     continue
 
-                ok = await post_inline_discussion(client, project_id, mr_iid, diff_refs, it)
+                ok = await post_inline_discussion(
+                    client, project_id, mr_iid, diff_refs, it, existing_discussions
+                )
                 if ok:
                     posted += 1
                 else:
