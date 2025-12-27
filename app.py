@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,10 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "35840"))
 MAX_DIFF_CHARS = int(os.getenv("MAX_DIFF_CHARS", "20000"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))
 SEM = asyncio.Semaphore(int(os.getenv("CONCURRENCY", "2")))
+
+# Кэш обработанных SHA (project_id:mr_iid:sha -> timestamp)
+PROCESSED_COMMITS: Dict[str, float] = {}
+CACHE_TTL = 3600  # 1 час
 
 
 def gl_headers() -> Dict[str, str]:
@@ -85,6 +90,15 @@ async def get_mr_diff_refs_and_changes(
     changes = await gitlab_get(client, f"/api/v4/projects/{project_id}/merge_requests/{mr_iid}/changes")
     files = changes.get("changes") or []
     return diff_refs, files
+
+
+async def get_commit_diff(
+    client: httpx.AsyncClient, project_id: int, commit_sha: str
+) -> List[Dict[str, Any]]:
+    """Получить diff только для конкретного коммита"""
+    commit = await gitlab_get(client, f"/api/v4/projects/{project_id}/repository/commits/{commit_sha}")
+    diffs = await gitlab_get(client, f"/api/v4/projects/{project_id}/repository/commits/{commit_sha}/diff")
+    return diffs or []
 
 
 def build_diff_text(files: List[Dict[str, Any]]) -> str:
@@ -175,6 +189,9 @@ def is_duplicate_comment(
     existing_discussions: List[Dict[str, Any]], path: str, line: int, comment: str
 ) -> bool:
     """Проверить, существует ли уже комментарий на этой позиции"""
+    # Нормализуем комментарий для сравнения (убираем лишние пробелы)
+    normalized_comment = " ".join(comment.split())
+    
     for disc in existing_discussions:
         notes = disc.get("notes") or []
         for note in notes:
@@ -191,8 +208,15 @@ def is_duplicate_comment(
             note_path = position.get("new_path") or position.get("old_path")
             note_line = position.get("new_line") or position.get("old_line")
             
-            # Если позиция и комментарий совпадают, это дубликат
-            if note_path == path and note_line == line and comment in body:
+            # Проверяем совпадение файла и строки
+            if note_path != path or note_line != line:
+                continue
+            
+            # Нормализуем body для сравнения
+            normalized_body = " ".join(body.split())
+            
+            # Проверяем, что текст комментария совпадает (не просто содержится)
+            if normalized_comment in normalized_body:
                 return True
     return False
 
@@ -239,6 +263,27 @@ async def post_general_note(client: httpx.AsyncClient, project_id: int, mr_iid: 
     await gitlab_post(client, f"/api/v4/projects/{project_id}/merge_requests/{mr_iid}/notes", {"body": text})
 
 
+def cleanup_old_cache_entries() -> None:
+    """Очистить старые записи из кэша"""
+    current_time = time.time()
+    keys_to_remove = [k for k, v in PROCESSED_COMMITS.items() if current_time - v > CACHE_TTL]
+    for k in keys_to_remove:
+        PROCESSED_COMMITS.pop(k, None)
+
+
+def is_commit_processed(project_id: int, mr_iid: int, sha: str) -> bool:
+    """Проверить, был ли уже обработан этот коммит"""
+    cleanup_old_cache_entries()
+    key = f"{project_id}:{mr_iid}:{sha}"
+    return key in PROCESSED_COMMITS
+
+
+def mark_commit_processed(project_id: int, mr_iid: int, sha: str) -> None:
+    """Отметить коммит как обработанный"""
+    key = f"{project_id}:{mr_iid}:{sha}"
+    PROCESSED_COMMITS[key] = time.time()
+
+
 async def process_merge_request(payload: Dict[str, Any]) -> None:
     async with SEM:
         try:
@@ -248,20 +293,47 @@ async def process_merge_request(payload: Dict[str, Any]) -> None:
             return
 
         async with httpx.AsyncClient() as client:
+            # Получаем diff_refs для проверки SHA
+            diff_refs, files = await get_mr_diff_refs_and_changes(client, project_id, mr_iid)
+            head_sha = diff_refs.get("head_sha", "")
+            
+            # Проверяем, не обрабатывали ли мы уже этот коммит
+            if head_sha and is_commit_processed(project_id, mr_iid, head_sha):
+                return  # Уже обрабатывали этот коммит
+            
             # Получаем существующие discussions для проверки дубликатов
             existing_discussions = await get_existing_discussions(client, project_id, mr_iid)
             
-            diff_refs, files = await get_mr_diff_refs_and_changes(client, project_id, mr_iid)
+            # Пытаемся получить diff только последнего коммита
+            # Проверяем, есть ли информация о последнем коммите в payload
+            last_commit = None
+            obj_attrs = payload.get("object_attributes") or {}
+            if obj_attrs.get("last_commit"):
+                last_commit = obj_attrs["last_commit"].get("id")
+            
+            # Если это update и есть last_commit, используем только его diff
+            action = obj_attrs.get("action")
+            if action == "update" and last_commit:
+                try:
+                    files = await get_commit_diff(client, project_id, last_commit)
+                except Exception:
+                    # Если не получилось - используем весь MR diff
+                    pass
+            
             diff_text = build_diff_text(files)
 
             if not diff_text.strip():
                 await post_general_note(client, project_id, mr_iid, "🤖 AI review: изменений для анализа нет.")
+                if head_sha:
+                    mark_commit_processed(project_id, mr_iid, head_sha)
                 return
 
             try:
                 items = await call_opus_anthropic(client, diff_text)
             except Exception as e:
                 await post_general_note(client, project_id, mr_iid, f"🤖 AI review: ошибка вызова модели: `{e}`")
+                if head_sha:
+                    mark_commit_processed(project_id, mr_iid, head_sha)
                 return
 
             diff_map = {}
@@ -294,6 +366,10 @@ async def process_merge_request(payload: Dict[str, Any]) -> None:
 
             if posted == 0 and not fallback:
                 await post_general_note(client, project_id, mr_iid, "🤖 AI review: критичных замечаний не найдено.")
+            
+            # Отмечаем коммит как обработанный
+            if head_sha:
+                mark_commit_processed(project_id, mr_iid, head_sha)
 
 
 @app.post("/ai-review")
